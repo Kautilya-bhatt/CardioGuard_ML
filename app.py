@@ -92,8 +92,8 @@ YN = {0: "No", 1: "Yes"}
 PRESETS = {
     "low": dict(age=38, sex=0, cp=2, bp=118, chol=190, fbs=0, ekg=0, hr=172,
                 angina=0, st=0.0, slope=1, vessels=0),
-    "mid": dict(age=55, sex=1, cp=3, bp=135, chol=245, fbs=0, ekg=1, hr=150,
-                angina=0, st=1.0, slope=2, vessels=1),
+    "mid": dict(age=57, sex=1, cp=3, bp=134, chol=245, fbs=0, ekg=1, hr=146,
+                angina=0, st=1.0, slope=2, vessels=0),
     "high": dict(age=63, sex=1, cp=4, bp=160, chol=300, fbs=1, ekg=2, hr=118,
                  angina=1, st=3.2, slope=2, vessels=3),
 }
@@ -267,6 +267,32 @@ def load_insights():
         corr=corr.sample(min(len(corr), 60000), random_state=1).corr(),
         counts=df[TARGET].value_counts(),
         age=df[["Age", TARGET]].sample(min(len(df), 40000), random_state=1),
+    )
+
+
+@st.cache_data(show_spinner="Evaluating model on hold-out data…")
+def evaluate():
+    """Heavy metrics computed ONCE and cached, so sliders stay instant."""
+    from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score, precision_score,
+                                 recall_score, roc_auc_score, roc_curve)
+    info = load_insights()
+    if info is None:
+        return None
+    yte, Xte = info["y_test"], info["X_test"]
+    ypred = model.predict(Xte)
+    yprob = model.predict_proba(Xte[FEATURES])[:, POS]
+    ybin = (yte == "Presence").astype(int)
+    fpr, tpr, _ = roc_curve(ybin, yprob)
+    idx = np.linspace(0, len(fpr) - 1, min(len(fpr), 400)).astype(int)
+    return dict(
+        n=len(yte),
+        acc=accuracy_score(yte, ypred),
+        prec=precision_score(yte, ypred, pos_label="Presence"),
+        rec=recall_score(yte, ypred, pos_label="Presence"),
+        f1=f1_score(yte, ypred, pos_label="Presence"),
+        auc=roc_auc_score(ybin, yprob),
+        cm=confusion_matrix(yte, ypred, labels=["Absence", "Presence"]),
+        fpr=fpr[idx], tpr=tpr[idx],
     )
 
 
@@ -567,6 +593,17 @@ with t_batch:
                 ok = bdf.dropna(subset=FEATURES).copy()
                 if len(ok) < len(bdf):
                     st.warning(f"{len(bdf)-len(ok)} row(s) with missing values were skipped.")
+                num = ok[FEATURES].apply(pd.to_numeric, errors="coerce")
+                if num.isna().any().any():
+                    st.error("Some feature values are not numeric. Please clean the CSV and re-upload.")
+                    st.stop()
+                ok[FEATURES] = num
+                lim = {"Age": (29, 77), "BP": (94, 200), "Cholesterol": (126, 564),
+                       "Max HR": (71, 202), "ST depression": (0, 6.2)}
+                oor = sum(int(((ok[c] < lo) | (ok[c] > hi)).sum()) for c, (lo, hi) in lim.items())
+                if oor:
+                    st.warning(f"{oor} value(s) lie outside the range the model was trained on "
+                               "(e.g. Age 29–77, BP 94–200). Predictions for them are less reliable.")
                 ok["Risk %"] = (proba(ok) * 100).round(1)
                 ok["Prediction"] = np.where(ok["Risk %"] >= 50, "Presence", "Absence")
                 ok["Risk level"] = pd.cut(ok["Risk %"], [-1, 30, 60, 101],
@@ -602,18 +639,11 @@ with t_model:
         st.info("📁 Put **train.csv** next to `app.py` to unlock hold-out metrics, ROC curve, "
                 "confusion matrix and data analytics.")
     else:
-        from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score, precision_score,
-                                     recall_score, roc_auc_score, roc_curve)
-        yte, Xte = info["y_test"], info["X_test"]
-        ypred, yprob = model.predict(Xte), proba(Xte)
-        ybin = (yte == "Presence").astype(int)
-
-        head("Hold-out performance", f"Same 75/25 split as the notebook · {len(yte):,} unseen rows.")
-        auc = roc_auc_score(ybin, yprob)
-        vals = [("Accuracy", f"{accuracy_score(yte, ypred)*100:.1f}%"),
-                ("Precision", f"{precision_score(yte, ypred, pos_label='Presence')*100:.1f}%"),
-                ("Recall", f"{recall_score(yte, ypred, pos_label='Presence')*100:.1f}%"),
-                ("F1-score", f"{f1_score(yte, ypred, pos_label='Presence')*100:.1f}%"),
+        ev = evaluate()
+        auc = ev["auc"]
+        head("Hold-out performance", f"Same 75/25 split as the notebook · {ev['n']:,} unseen rows.")
+        vals = [("Accuracy", f"{ev['acc']*100:.1f}%"), ("Precision", f"{ev['prec']*100:.1f}%"),
+                ("Recall", f"{ev['rec']*100:.1f}%"), ("F1-score", f"{ev['f1']*100:.1f}%"),
                 ("ROC-AUC", f"{auc:.3f}")]
         for col, (n, v) in zip(st.columns(5), vals):
             with col: kpi(n, v)
@@ -621,17 +651,15 @@ with t_model:
 
         a, b = st.columns(2, gap="large")
         with a:
-            cm = confusion_matrix(yte, ypred, labels=["Absence", "Presence"])
+            cm = ev["cm"]
             fig = go.Figure(go.Heatmap(z=cm, x=["Pred Absence", "Pred Presence"],
                                        y=["Actual Absence", "Actual Presence"], text=cm,
                                        texttemplate="%{text:,}", colorscale="Tealgrn", showscale=False))
             fig.update_yaxes(autorange="reversed")
             show(layout(fig, 360, title="Confusion matrix"))
         with b:
-            fpr, tpr, _ = roc_curve(ybin, yprob)
-            idx = np.linspace(0, len(fpr) - 1, min(len(fpr), 400)).astype(int)
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=fpr[idx], y=tpr[idx], mode="lines", name="ROC",
+            fig.add_trace(go.Scatter(x=ev["fpr"], y=ev["tpr"], mode="lines", name="ROC",
                                      line=dict(color=C_CYAN, width=4),
                                      fill="tozeroy", fillcolor="rgba(34,211,238,.1)"))
             fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", name="Chance",
