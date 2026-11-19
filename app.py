@@ -9,9 +9,12 @@ RUN
     streamlit run app.py
 
 FILES (keep in the same folder as app.py)
-    Heart_disease.pki   trained model saved with joblib   (REQUIRED; any *.pki name works)
-    train.csv           original dataset                  (optional - unlocks
-                                                           metrics / ROC / heatmap)
+    Heart_disease_v2.pki  improved model from train_model.py  (recommended)
+    Heart_disease*.pki    older 12-feature model also works   (any *.pki name works)
+    train.csv             original dataset  (optional - unlocks metrics / ROC / heatmap)
+
+The app adapts automatically: if the model was trained with Thallium it shows
+that input, otherwise it hides it.
 
 Works with Streamlit 1.30 and newer.
 """
@@ -65,15 +68,16 @@ def show(fig):
 # 1. CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_CANDIDATES = ["Heart_disease.pki", "Heart_disease__2_.pki", "Heart_disease__1_.pki",
-                    "Heart_disease.pkl", "Heart_disease.joblib"]
+MODEL_CANDIDATES = ["Heart_disease_v2.pki", "Heart_disease.pki", "Heart_disease__2_.pki",
+                    "Heart_disease__1_.pki", "Heart_disease.pkl", "Heart_disease.joblib"]
 DATA_FILE = "train.csv"
 
-FEATURES = [
+ALL_FEATURES = [
     "Age", "Sex", "Chest pain type", "BP", "Cholesterol", "FBS over 120",
     "EKG results", "Max HR", "Exercise angina", "ST depression",
-    "Slope of ST", "Number of vessels fluro",
+    "Slope of ST", "Number of vessels fluro", "Thallium",
 ]
+FEATURES = list(ALL_FEATURES)   # narrowed to what the loaded model needs
 TARGET = "Heart Disease"
 
 # (min, max, dataset mean) from train.csv — used for the radar chart
@@ -88,14 +92,19 @@ EKG = {0: "Normal", 1: "ST-T wave abnormality", 2: "LV hypertrophy"}
 SLOPE = {1: "Upsloping", 2: "Flat", 3: "Downsloping"}
 SEX = {0: "Female", 1: "Male"}
 YN = {0: "No", 1: "Yes"}
+THAL = {3: "Normal", 6: "Fixed defect", 7: "Reversible defect"}
+
+# Real disease rates in train.csv (used to explain the model to students)
+RATE_CP = {1: 10.8, 2: 16.2, 3: 19.1, 4: 69.7}
+RATE_THAL = {3: 19.8, 6: 68.6, 7: 81.5}
 
 PRESETS = {
     "low": dict(age=38, sex=0, cp=2, bp=118, chol=190, fbs=0, ekg=0, hr=172,
-                angina=0, st=0.0, slope=1, vessels=0),
-    "mid": dict(age=57, sex=1, cp=3, bp=134, chol=245, fbs=0, ekg=1, hr=146,
-                angina=0, st=1.0, slope=2, vessels=0),
+                angina=0, st=0.0, slope=1, vessels=0, thal=3),
+    "mid": dict(age=58, sex=1, cp=3, bp=136, chol=250, fbs=0, ekg=2, hr=140,
+                angina=0, st=1.5, slope=2, vessels=0, thal=3),
     "high": dict(age=63, sex=1, cp=4, bp=160, chol=300, fbs=1, ekg=2, hr=118,
-                 angina=1, st=3.2, slope=2, vessels=3),
+                 angina=1, st=3.2, slope=2, vessels=3, thal=7),
 }
 
 C_LOW, C_MOD, C_HIGH = "#2ee6a6", "#ffc233", "#ff5c85"
@@ -210,23 +219,28 @@ def layout(fig, h=380, **kw):
 # ──────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model…")
 def load_model():
-    """Loads the first model file found next to app.py.
-    Any name works: Heart_disease.pki, Heart_disease__2_.pki, model.pkl, ..."""
+    """Loads the first model file that works. Returns (model, name, error, skipped_files).
+    Any name works: Heart_disease_v2.pki, Heart_disease__2_.pki, model.pkl, ..."""
+    skipped, last = [], (None, None)
     for folder in dict.fromkeys([BASE_DIR, Path.cwd()]):
         found = [folder / n for n in MODEL_CANDIDATES if (folder / n).exists()]
         extra = sorted(p for ext in ("*.pki", "*.pkl", "*.joblib") for p in folder.glob(ext)
                        if p not in found)
         for p in found + extra:
             try:
-                return joblib.load(p), p.name, None
+                m = joblib.load(p)
+                if not hasattr(m, "predict_proba"):
+                    raise ValueError("file is not a classifier")
+                return m, p.name, None, skipped
             except Exception as e:  # noqa: BLE001
-                last_err = (p.name, str(e))
-        if found or extra:
-            return None, last_err[0], last_err[1]
-    return None, None, None
+                skipped.append((p.name, str(e)[:160]))
+                last = (p.name, str(e))
+        if skipped:
+            return None, last[0], last[1], skipped
+    return None, None, None, skipped
 
 
-model, model_file, model_err = load_model()
+model, model_file, model_err, skipped_models = load_model()
 
 if model is None:
     st.markdown("<div class='hero'><h1>🫀 CardioGuard AI</h1></div>", unsafe_allow_html=True)
@@ -244,8 +258,62 @@ if model is None:
 scaler = model.named_steps["scaler"]
 clf = model.named_steps["classifier"]
 POS = list(model.classes_).index("Presence")
-COEF = clf.coef_[0] if POS == 1 else -clf.coef_[0]
-BASELINE = float(1 / (1 + np.exp(-(clf.intercept_[0] if POS == 1 else -clf.intercept_[0]))))
+SIGN = 1.0 if POS == 1 else -1.0
+COEF = SIGN * clf.coef_[0]
+INTERCEPT = SIGN * float(clf.intercept_[0])
+BASELINE = float(1 / (1 + np.exp(-INTERCEPT)))
+RAW_NAMES = list(getattr(model, "feature_names_in_", ALL_FEATURES[:12]))   # columns the model sees
+FEATURES = [f for f in ALL_FEATURES
+            if any(n == f or n.startswith(f + "_") for n in RAW_NAMES)]       # inputs the user fills
+HAS_THAL = "Thallium" in FEATURES
+
+if skipped_models:
+    st.warning("⚠️ " + " · ".join(f"`{n}` could not be loaded ({e})" for n, e in skipped_models)
+               + f" — using `{model_file}` instead. To fix: run `python train_model.py` in this same "
+                 "environment, or install the scikit-learn version the model was saved with.")
+
+
+def design(df: pd.DataFrame) -> pd.DataFrame:
+    """Raw inputs -> the exact columns the model was trained on (adds one 0/1 column per
+    category label, e.g. 'Chest pain type_4'). Works for both the old and the v2 model."""
+    out = {}
+    for n in RAW_NAMES:
+        if n in df.columns:
+            out[n] = pd.to_numeric(df[n])
+        else:
+            f, _, v = n.rpartition("_")
+            out[n] = (df[f].astype(float) == float(v)).astype(int)
+    return pd.DataFrame(out, index=df.index)
+
+
+def to_z(df: pd.DataFrame) -> np.ndarray:
+    """Raw inputs -> the standardised numbers the logistic regression actually sees."""
+    return scaler.transform(design(df))
+
+
+def term_names() -> list:
+    """Names of the columns the regression sees (one per weight)."""
+    return list(RAW_NAMES)
+
+
+def owner_of(term: str) -> str:
+    """Which original input does a regression column belong to?"""
+    for f in sorted(FEATURES, key=len, reverse=True):
+        if term == f or term.startswith(f + "_"):
+            return f
+    return term
+
+
+def pretty_term(term: str) -> str:
+    f = owner_of(term)
+    if term == f:
+        return f
+    val = term[len(f) + 1:]
+    maps = {"Chest pain type": CP, "EKG results": EKG, "Slope of ST": SLOPE, "Thallium": THAL}
+    try:
+        return f"{f}: {maps[f][int(float(val))]}"
+    except Exception:  # noqa: BLE001
+        return f"{f} = {val}"
 
 
 @st.cache_data(show_spinner="Preparing evaluation data (first time only)…")
@@ -260,7 +328,7 @@ def load_insights():
     df = pd.read_csv(path).drop_duplicates()
     X, y = df[FEATURES], df[TARGET]
     _, X_te, _, y_te = train_test_split(X, y, test_size=0.25, random_state=42, stratify=y)
-    corr = df[FEATURES + ["Thallium"]].copy()
+    corr = df[ALL_FEATURES].copy()
     corr["Target"] = (df[TARGET] == "Presence").astype(int)
     return dict(
         X_test=X_te, y_test=y_te, n_rows=len(df),
@@ -279,8 +347,8 @@ def evaluate():
     if info is None:
         return None
     yte, Xte = info["y_test"], info["X_test"]
-    ypred = model.predict(Xte)
-    yprob = model.predict_proba(Xte[FEATURES])[:, POS]
+    ypred = model.predict(design(Xte))
+    yprob = proba(Xte)
     ybin = (yte == "Presence").astype(int)
     fpr, tpr, _ = roc_curve(ybin, yprob)
     idx = np.linspace(0, len(fpr) - 1, min(len(fpr), 400)).astype(int)
@@ -300,7 +368,7 @@ def evaluate():
 # 4. HELPERS
 # ──────────────────────────────────────────────────────────────────────────
 def proba(df: pd.DataFrame) -> np.ndarray:
-    return model.predict_proba(df[FEATURES])[:, POS]
+    return model.predict_proba(design(df))[:, POS]
 
 
 def band(p: float):
@@ -312,15 +380,35 @@ def band(p: float):
 
 
 def contributions(row: pd.DataFrame) -> pd.DataFrame:
-    z = (row[FEATURES].values[0] - scaler.mean_) / scaler.scale_
-    return pd.DataFrame({"Feature": FEATURES, "Value": row[FEATURES].values[0],
-                         "Contribution": COEF * z}).sort_values("Contribution")
+    """Exact push each original input gives to the log-odds, versus an average patient.
+    (one-hot columns are added back together so every input has ONE bar)"""
+    z = to_z(row)[0]
+    parts = pd.DataFrame({"Feature": [owner_of(t) for t in term_names()], "Contribution": COEF * z})
+    agg = parts.groupby("Feature", sort=False)["Contribution"].sum()
+    out = pd.DataFrame({"Feature": FEATURES, "Value": row[FEATURES].values[0]})
+    out["Contribution"] = out["Feature"].map(agg).fillna(0.0).values
+    return out.sort_values("Contribution")
+
+
+def pct(p: float) -> str:
+    """Never claim certainty: show >99% / <1% instead of 100.0% / 0.0%."""
+    return ">99%" if p > 0.99 else "<1%" if p < 0.01 else f"{p*100:.1f}%"
+
+
+def edge_count(row: pd.Series) -> int:
+    """How many numeric inputs sit at the extreme 10% edge of the training range."""
+    n = 0
+    for k, (lo, hi, _) in RANGES.items():
+        if k in row.index and k != "Number of vessels fluro":
+            span = hi - lo
+            n += int(row[k] <= lo + 0.1 * span or row[k] >= hi - 0.1 * span)
+    return n
 
 
 def fmt_val(feat: str, v) -> str:
     v = float(v)
     maps = {"Sex": SEX, "Chest pain type": CP, "EKG results": EKG, "Slope of ST": SLOPE,
-            "FBS over 120": YN, "Exercise angina": YN}
+            "FBS over 120": YN, "Exercise angina": YN, "Thallium": THAL}
     if feat in maps:
         return maps[feat].get(int(v), str(v))
     return f"{v:g}"
@@ -329,7 +417,7 @@ def fmt_val(feat: str, v) -> str:
 def gauge(p: float) -> go.Figure:
     color = band(p)[2]
     fig = go.Figure(go.Indicator(
-        mode="gauge+number+delta", value=p * 100,
+        mode="gauge+number+delta", value=float(np.clip(p * 100, 1, 99)),
         number={"suffix": "%", "valueformat": ".1f", "font": {"size": 52, "color": color}},
         delta={"reference": BASELINE * 100, "valueformat": "+.1f", "suffix": " vs avg patient",
                "increasing": {"color": C_HIGH}, "decreasing": {"color": C_LOW},
@@ -386,7 +474,7 @@ def report_text(r: pd.Series, p: float) -> str:
         "CARDIOGUARD AI — PATIENT RISK REPORT", "=" * 46,
         f"Generated : {datetime.now():%d %b %Y, %H:%M}",
         f"Result    : {lab}",
-        f"Probability of heart disease : {p*100:.1f}%",
+        f"Probability of heart disease : {pct(p)}",
         f"Average-patient baseline     : {BASELINE*100:.1f}%", "",
         "INPUT PARAMETERS", "-" * 46, *rows, "",
         "DISCLAIMER", "Educational ML project (Logistic Regression). Not a medical diagnosis.",
@@ -430,36 +518,72 @@ with st.sidebar:
     b3.button("🔴 High", on_click=set_preset, args=("high",), **STRETCH)
 
     st.markdown("### 👤 1 · Demographics")
-    age = st.slider("Age (years)", 29, 77, key="age")
-    sex = st.radio("Sex", [0, 1], format_func=SEX.get, horizontal=True, key="sex")
+    age = st.slider("Age (years)", 29, 77, key="age",
+                    help="Risk goes up with age because arteries slowly stiffen and narrow.")
+    sex = st.radio("Sex", [0, 1], format_func=SEX.get, horizontal=True, key="sex",
+                   help="A statistical pattern in this dataset (about 56% of men vs 18% of women had "
+                        "disease). It is not a judgement about any person.")
 
     st.markdown("### 🩸 2 · Vitals & labs")
     bp = st.slider("Resting blood pressure (mmHg)", 94, 200, key="bp",
-                   help="Normal is below 120/80. 130+ is considered elevated.")
+                   help="How hard blood pushes on artery walls while resting. Normal is about 120. "
+                        "Higher means the heart works harder.")
     chol = st.slider("Serum cholesterol (mg/dL)", 126, 564, key="chol",
-                     help="Below 200 is desirable.")
+                     help="A fatty substance in blood. Too much can build up inside arteries. "
+                          "Below 200 is considered good.")
     fbs = st.radio("Fasting blood sugar > 120 mg/dL", [0, 1], format_func=YN.get,
-                   horizontal=True, key="fbs")
+                   horizontal=True, key="fbs",
+                   help="Blood sugar measured after not eating. Over 120 can point to diabetes, "
+                        "which damages blood vessels.")
 
     st.markdown("### 🫀 3 · Cardiac tests")
-    cp = st.selectbox("Chest pain type", list(CP), format_func=CP.get, key="cp")
-    ekg = st.selectbox("Resting EKG result", list(EKG), format_func=EKG.get, key="ekg")
+    cp = st.selectbox("Chest pain type", list(CP), format_func=lambda k: f"{k} · {CP[k]}", key="cp",
+                      help="Type of chest pain felt. The numbers are LABELS, not a scale. "
+                           "Surprise: 4 (Asymptomatic = no classic chest pain) has the HIGHEST "
+                           "disease rate in this data, because these patients were sent for heart "
+                           "tests anyway. See the Guide tab for the full explanation.")
+    st.caption(f"📊 In the training data, **{RATE_CP[cp]:.0f}%** of patients with this chest-pain type "
+               "had heart disease.")
+    if cp == 4:
+        st.info("Asymptomatic ≠ safe. Many heart problems are silent, so this group has the highest "
+                "disease rate in the data.")
+    ekg = st.selectbox("Resting EKG result", list(EKG), format_func=lambda k: f"{k} · {EKG[k]}",
+                       key="ekg", help="The heart's electrical recording while resting.")
     hr = st.slider("Maximum heart rate (bpm)", 71, 202, key="hr",
-                   help="Highest heart rate reached during the exercise test.")
+                   help="Highest pulse reached during the exercise test. A healthy heart can speed up "
+                        "a lot, so HIGHER is better (lowers risk).")
     angina = st.radio("Exercise-induced angina", [0, 1], format_func=YN.get,
-                      horizontal=True, key="angina")
+                      horizontal=True, key="angina",
+                      help="Did the exercise test cause chest pain? 'Yes' is a warning sign.")
     st_dep = st.slider("ST depression", 0.0, 6.2, step=0.1, key="st",
-                       help="ST-segment drop induced by exercise relative to rest.")
-    slope = st.selectbox("Slope of peak-exercise ST", list(SLOPE), format_func=SLOPE.get, key="slope")
-    vessels = st.select_slider("Major vessels coloured by fluoroscopy", [0, 1, 2, 3], key="vessels")
+                       help="How far a part of the EKG wave dips during exercise compared with rest. "
+                            "A bigger dip means the heart muscle is struggling.")
+    slope = st.selectbox("Slope of peak-exercise ST", list(SLOPE),
+                         format_func=lambda k: f"{k} · {SLOPE[k]}", key="slope",
+                         help="Direction of the ST part of the EKG at peak exercise. "
+                              "Flat or downsloping is more worrying than upsloping.")
+    vessels = st.select_slider("Major vessels coloured by fluoroscopy", [0, 1, 2, 3], key="vessels",
+                               help="Number of main blood vessels (0-3) that show blockage on a "
+                                    "special X-ray. More blocked vessels = higher risk.")
+    if HAS_THAL:
+        thal = st.selectbox("Thallium stress test", list(THAL),
+                            format_func=lambda k: f"{k} · {THAL[k]}", key="thal",
+                            help="A scan that shows blood flow to the heart. Normal = good flow. "
+                                 "Fixed defect = permanent damage. Reversible defect = blood flow "
+                                 "drops under stress.")
+        st.caption(f"📊 In the training data, **{RATE_THAL[thal]:.0f}%** of patients with this result "
+                   "had heart disease.")
+    else:
+        thal = 3
 
-    st.caption(f"Model: `{model_file}` · 12 features")
+    st.caption(f"Model: `{model_file}` · {len(FEATURES)} features")
 
 patient = pd.DataFrame([{
     "Age": age, "Sex": sex, "Chest pain type": cp, "BP": bp, "Cholesterol": chol,
     "FBS over 120": fbs, "EKG results": ekg, "Max HR": hr, "Exercise angina": angina,
     "ST depression": st_dep, "Slope of ST": slope, "Number of vessels fluro": vessels,
-}])
+    "Thallium": thal,
+}])[FEATURES]
 prob = float(proba(patient)[0])
 label, vclass, vcolor, emoji = band(prob)
 contrib = contributions(patient)
@@ -470,7 +594,7 @@ contrib = contributions(patient)
 st.markdown(
     "<div class='hero'><h1><span class='beat'>🫀</span> CardioGuard AI</h1>"
     "<p>Intelligent heart disease risk prediction — predict early, protect every beat.</p>"
-    "<span class='tag'>Logistic Regression</span><span class='tag'>12 clinical features</span>"
+    "<span class='tag'>Logistic Regression</span><span class='tag'>" + str(len(FEATURES)) + " clinical features</span>"
     "<span class='tag'>Explainable</span><span class='tag'>Live predictions</span></div>",
     unsafe_allow_html=True)
 
@@ -494,9 +618,18 @@ with t_risk:
         st.markdown(f"<div class='verdict {vclass}'><h2>{emoji} {label}</h2><p>{msg}</p></div>",
                     unsafe_allow_html=True)
         k1, k2, k3 = st.columns(3)
-        with k1: kpi("Presence", f"{prob*100:.1f}%", "heart disease")
-        with k2: kpi("Absence", f"{(1-prob)*100:.1f}%", "no disease")
+        with k1: kpi("Presence", pct(prob), "heart disease")
+        with k2: kpi("Absence", pct(1 - prob), "no disease")
         with k3: kpi("Avg patient", f"{BASELINE*100:.1f}%", "baseline risk")
+        if prob > 0.99 or prob < 0.01 or edge_count(patient.iloc[0]) >= 3:
+            if edge_count(patient.iloc[0]) >= 3:
+                st.warning("🔎 **Reality check:** this is an extreme combination. Several inputs sit at "
+                           "the edge of what the model saw during training, and real patients rarely "
+                           "look like this. Read the result as 'very high / very low', not as an exact "
+                           "percentage. The display never goes above 99% or below 1%.")
+            else:
+                st.info("🔎 The model is very confident here, but no model can be 100% sure. Read this "
+                        "as 'very high / very low'. The display never goes above 99% or below 1%.")
         st.write("")
         st.download_button("⬇️ Download patient report (.txt)", report_text(patient.iloc[0], prob),
                            f"cardioguard_report_{datetime.now():%Y%m%d_%H%M}.txt", "text/plain", **STRETCH)
@@ -522,6 +655,30 @@ with t_risk:
                         f" &nbsp;<span style='color:#2ee6a6'>({r['Contribution']:+.2f})</span></div>",
                         unsafe_allow_html=True)
 
+    total_eff = float(contrib["Contribution"].sum())
+    score = INTERCEPT + total_eff
+    with st.expander("🎓 How did the model calculate this? (simple explanation for students)"):
+        st.markdown(f"""
+Logistic Regression turns your inputs into a **score**, then turns the score into a **percentage**.
+
+1. **Start** with the score of an *average* patient: `{INTERCEPT:+.2f}` (that is {BASELINE*100:.1f}% risk).
+2. **Every input adds or subtracts points.** Inputs worse than average add points (red bars), better than average subtract points (green bars). This patient's inputs add up to `{total_eff:+.2f}`.
+3. **Final score** = `{INTERCEPT:+.2f}` + `{total_eff:+.2f}` = **`{score:+.2f}`**
+4. **Squash the score into 0–100%** with the S-shaped *sigmoid* curve: `risk = 1 / (1 + e^(−score))` = **{pct(prob)}**
+        """)
+        xs = np.linspace(-8, 8, 200)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=xs, y=1 / (1 + np.exp(-xs)) * 100, mode="lines", name="Sigmoid curve",
+                                 line=dict(color=C_CYAN, width=4)))
+        fig.add_trace(go.Scatter(x=[float(np.clip(score, -8, 8))], y=[prob * 100], mode="markers",
+                                 name="This patient",
+                                 marker=dict(size=16, color=vcolor, line=dict(color="#fff", width=2))))
+        fig.add_hline(y=50, line_dash="dot", line_color="rgba(255,255,255,.3)")
+        show(layout(fig, 300, xaxis_title="Score (log-odds)", yaxis_title="Risk %",
+                    yaxis=dict(range=[0, 100])))
+        st.caption("A score of 0 means 50%. Each +1 on the score raises the odds about 2.7 times. "
+                   "The curve flattens at both ends, so very high scores all look like ~100%.")
+
     head("🩻 Clinical snapshot", "Rule-of-thumb thresholds for context only — they are not model inputs.")
     st.markdown("".join(f"<span class='chip {lvl}'>{n}: {v}</span>"
                         for n, v, lvl in vital_flags(patient.iloc[0])), unsafe_allow_html=True)
@@ -546,8 +703,9 @@ with t_why:
     show(fig)
     total = contrib["Contribution"].sum()
     st.markdown(
-        f"<div class='ins info'>Sum of all effects: <b>{total:+.2f}</b> log-odds → predicted risk "
-        f"<b>{prob*100:.1f}%</b> (average patient: {BASELINE*100:.1f}%).</div>", unsafe_allow_html=True)
+        f"<div class='ins info'>Start score <b>{INTERCEPT:+.2f}</b> + effects <b>{total:+.2f}</b> = "
+        f"<b>{INTERCEPT + total:+.2f}</b> → predicted risk <b>{pct(prob)}</b> "
+        f"(average patient: {BASELINE*100:.1f}%).</div>", unsafe_allow_html=True)
 
 # ═════════════ TAB 3 — WHAT-IF ═════════════
 with t_what:
@@ -578,8 +736,8 @@ with t_what:
 # ═════════════ TAB 4 — BATCH ═════════════
 with t_batch:
     head("Batch prediction", "Upload a CSV with the 12 feature columns to score many patients at once.")
-    tpl = pd.DataFrame([dict(zip(FEATURES, [38, 0, 2, 118, 190, 0, 0, 172, 0, 0.0, 1, 0])),
-                        dict(zip(FEATURES, [63, 1, 4, 160, 300, 1, 2, 118, 1, 3.2, 2, 3]))])
+    tpl = pd.DataFrame([dict(zip(ALL_FEATURES, [38, 0, 2, 118, 190, 0, 0, 172, 0, 0.0, 1, 0, 3])),
+                        dict(zip(ALL_FEATURES, [63, 1, 4, 160, 300, 1, 2, 118, 1, 3.2, 2, 3, 7]))])[FEATURES]
     st.download_button("📄 Download CSV template", tpl.to_csv(index=False),
                        "cardioguard_template.csv", "text/csv")
     f = st.file_uploader("Upload CSV", type="csv")
@@ -626,11 +784,14 @@ with t_batch:
 # ═════════════ TAB 5 — MODEL INSIGHTS ═════════════
 with t_model:
     head("What the model learned", "Standardised logistic-regression coefficients (red raises risk, green lowers it).")
-    cdf = pd.DataFrame({"Feature": FEATURES, "Coefficient": COEF,
+    terms = [pretty_term(t) for t in term_names()]
+    cdf = pd.DataFrame({"Input": terms, "Coefficient": COEF,
                         "Odds ratio (per 1 SD)": np.exp(COEF)}).sort_values("Coefficient")
-    fig = go.Figure(go.Bar(x=cdf["Coefficient"], y=cdf["Feature"], orientation="h",
+    fig = go.Figure(go.Bar(x=cdf["Coefficient"], y=cdf["Input"], orientation="h",
                            marker=dict(color=[C_HIGH if v > 0 else C_LOW for v in cdf["Coefficient"]])))
-    show(layout(fig, 430, xaxis_title="Standardised coefficient"))
+    show(layout(fig, max(430, 24 * len(cdf) + 80), xaxis_title="Standardised coefficient"))
+    st.caption("Category inputs (chest pain, EKG, slope, Thallium) get one weight per label, because "
+               "the labels are names, not amounts.")
     with st.expander("Coefficient table"):
         st.dataframe(cdf.sort_values("Coefficient", ascending=False).round(4), **STRETCH)
 
@@ -702,17 +863,55 @@ with t_help:
 </div>""", unsafe_allow_html=True)
     with g2:
         st.markdown("""
-<div class='card'><div class='kl'>Feature guide</div>
-<ul style='color:#cfdae7;line-height:1.85;margin-top:8px'>
-<li><b>Chest pain</b> — 1 typical · 2 atypical · 3 non-anginal · 4 asymptomatic</li>
-<li><b>Resting EKG</b> — 0 normal · 1 ST-T abnormality · 2 LV hypertrophy</li>
-<li><b>ST depression</b> — exercise-induced ST drop versus rest</li>
-<li><b>Slope of ST</b> — 1 up · 2 flat · 3 down</li>
-<li><b>Vessels</b> — major vessels (0–3) seen on fluoroscopy</li>
-</ul>
-<div class='kl' style='margin-top:10px'>Pipeline</div>
-<p style='color:#cfdae7'>Inputs → <code>StandardScaler</code> → <code>LogisticRegression</code> → P(Presence)</p>
+<div class='card'><div class='kl'>The model in one line</div>
+<p style='color:#cfdae7;margin-top:8px'>Inputs → (one-hot labels) → <code>StandardScaler</code> →
+<code>LogisticRegression</code> → score → sigmoid → <b>probability of heart disease</b>.</p>
+<div class='kl' style='margin-top:12px'>Risk bands</div>
+<span class='chip ok'>&lt; 30% Low</span><span class='chip warn'>30–60% Moderate</span><span class='chip bad'>&gt; 60% High</span>
+<p style='color:#8ea4bb;font-size:.85rem;margin-top:10px'>Bands were checked on 157,500 unseen patients: in the Low band about 9% really had disease, in Moderate about 44%, in High about 89%.</p>
 </div>""", unsafe_allow_html=True)
+
+    head("🤔 Questions students ask")
+    with st.expander("Why does chest pain type 4 (Asymptomatic) give HIGH risk and type 1 (Typical angina) give LOW?"):
+        st.markdown(f"""
+It looks backwards, but the model is only copying the data. In this dataset (patients who were sent for heart tests):
+
+| Chest pain type | Meaning | Share who had heart disease |
+|---|---|---|
+| 1 | Typical angina | **{RATE_CP[1]}%** |
+| 2 | Atypical angina | **{RATE_CP[2]}%** |
+| 3 | Non-anginal pain | **{RATE_CP[3]}%** |
+| 4 | Asymptomatic (no classic chest pain) | **{RATE_CP[4]}%** |
+
+**Why?** Many heart problems are *silent*. A patient with clear chest pain often has a harmless cause (muscle, stomach, stress), while a patient with *no* pain but abnormal test results is the one hiding a real problem. Also, the numbers 1–4 are **labels, not a scale**: 4 does not mean "4 times more pain". The model gives every label its own weight.
+        """)
+    with st.expander("Why do I get 'greater than 99%' when I set every input to its maximum?"):
+        st.markdown("""
+Maxing everything creates a patient who does not exist in real life: highest ST depression, 3 blocked vessels, reversible Thallium defect, angina, flat slope, and so on. Each of these alone already points strongly to disease in the data, and Logistic Regression **adds** all that evidence, so the score becomes huge and the sigmoid curve flattens near 100%.
+
+That is the model being consistent, not a bug. Two safety rules are built in: the display never shows exactly 100% or 0%, and a *Reality check* warning appears for extreme combinations. A real doctor would never trust a "100%" either.
+        """)
+    with st.expander("What is Logistic Regression? (30-second version)"):
+        st.markdown("""
+Think of a **scoreboard**. Every input gives points: a risky value adds points, a healthy value subtracts points. The total score is converted into a percentage by an S-shaped curve (the *sigmoid*). The weights are learned from about 470,000 patient records so that the percentages match what really happened to those patients.
+        """)
+    with st.expander("📖 Glossary: what does every input mean?"):
+        gloss = pd.DataFrame([
+            ("Age", "Years of age", "Higher age → higher risk"),
+            ("Sex", "Female / Male", "Males have a higher disease rate in this data"),
+            ("Chest pain type", "Kind of chest pain (label 1–4)", "4 (asymptomatic) has the highest rate"),
+            ("BP", "Resting blood pressure (mmHg)", "Tiny effect once other inputs are known"),
+            ("Cholesterol", "Fat in blood (mg/dL)", "Small effect in this data"),
+            ("FBS over 120", "Fasting blood sugar above 120?", "Tiny effect"),
+            ("EKG results", "Resting heart electrical test", "LV hypertrophy → higher risk"),
+            ("Max HR", "Highest pulse during exercise test", "Higher is healthier → lowers risk"),
+            ("Exercise angina", "Chest pain during exercise?", "Yes → higher risk"),
+            ("ST depression", "EKG dip during exercise", "Bigger dip → higher risk"),
+            ("Slope of ST", "Direction of EKG ST segment", "Flat / down → higher risk than up"),
+            ("Vessels (fluoroscopy)", "Blocked major vessels (0–3)", "More vessels → higher risk"),
+            ("Thallium", "Nuclear stress scan of blood flow", "Defects (6, 7) → much higher risk"),
+        ], columns=["Input", "What it is", "Effect on risk"])
+        st.dataframe(gloss, hide_index=True, **STRETCH)
 
 st.markdown(
     "<div class='disc'>⚠️ <b>Medical disclaimer:</b> CardioGuard AI is an educational machine-learning "
