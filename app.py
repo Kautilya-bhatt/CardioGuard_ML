@@ -9,7 +9,7 @@ RUN
     streamlit run app.py
 
 FILES (keep in the same folder as app.py)
-    Heart_disease.pki   trained model saved with joblib   (REQUIRED)
+    Heart_disease.pki   trained model saved with joblib   (REQUIRED; any *.pki name works)
     train.csv           original dataset                  (optional - unlocks
                                                            metrics / ROC / heatmap)
 
@@ -65,7 +65,7 @@ def show(fig):
 # 1. CONSTANTS
 # ──────────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_CANDIDATES = ["Heart_disease.pki", "Heart_disease__1_.pki",
+MODEL_CANDIDATES = ["Heart_disease.pki", "Heart_disease__2_.pki", "Heart_disease__1_.pki",
                     "Heart_disease.pkl", "Heart_disease.joblib"]
 DATA_FILE = "train.csv"
 
@@ -210,15 +210,19 @@ def layout(fig, h=380, **kw):
 # ──────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner="Loading model…")
 def load_model():
-    folders = [BASE_DIR, Path.cwd()]
-    for folder in folders:
-        for name in MODEL_CANDIDATES:
-            p = folder / name
-            if p.exists():
-                try:
-                    return joblib.load(p), name, None
-                except Exception as e:  # noqa: BLE001
-                    return None, name, str(e)
+    """Loads the first model file found next to app.py.
+    Any name works: Heart_disease.pki, Heart_disease__2_.pki, model.pkl, ..."""
+    for folder in dict.fromkeys([BASE_DIR, Path.cwd()]):
+        found = [folder / n for n in MODEL_CANDIDATES if (folder / n).exists()]
+        extra = sorted(p for ext in ("*.pki", "*.pkl", "*.joblib") for p in folder.glob(ext)
+                       if p not in found)
+        for p in found + extra:
+            try:
+                return joblib.load(p), p.name, None
+            except Exception as e:  # noqa: BLE001
+                last_err = (p.name, str(e))
+        if found or extra:
+            return None, last_err[0], last_err[1]
     return None, None, None
 
 
@@ -232,7 +236,7 @@ if model is None:
         st.info(f"Installed scikit-learn: **{sklearn.__version__}**. The model was saved with "
                 f"**1.6.1**. Fix:  `pip install scikit-learn==1.6.1`")
     else:
-        st.error("Model file **Heart_disease.pki** not found next to `app.py`.")
+        st.error("No model file (*.pki / *.pkl / *.joblib) found next to `app.py`.")
         st.info("Download it from your notebook (`joblib.dump(model, 'Heart_disease.pki')`) "
                 "and place it in the same folder as app.py, then refresh.")
     st.stop()
